@@ -1,0 +1,11 @@
+{
+  "name": "qi-agent",
+  "version": "0.1.0",
+  "description": "Plug an agent into Quai: publish one payment code, receive private Qi. Canary-gated reads, traps enforced in code.",
+  "type": "commonjs",
+  "main": "qi-agent.js",
+  "bin": { "qi-agent": "cli.js" },
+  "license": "MIT",
+  "scripts": { "test": "node selftest.js" },
+  "dependencies": { "quais": "^1.0.0-alpha.56" }
+}
