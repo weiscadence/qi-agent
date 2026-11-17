@@ -18,7 +18,7 @@
  */
 const path = require('path');
 const fs = require('fs');
-const { QiAgent, QiUntrustedError, QiTrapError, DEFAULT_DIR, DEFAULT_RPC } = require('./qi-agent');
+const { QiAgent, QiUntrustedError, QiTrapError, safeWalletName, DEFAULT_DIR, DEFAULT_RPC } = require('./qi-agent');
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -34,6 +34,7 @@ const RPC = flag('rpc', DEFAULT_RPC);
 /** Accept either a raw payment code or the name of a local wallet file, so demos read cleanly. */
 function resolveCode(x) {
   if (!x) return null;
+  if (!safeWalletName(x)) return x; // never turn an argument into a path outside the wallet dir
   const f = path.join(DIR, `${x}.json`);
   if (fs.existsSync(f)) return JSON.parse(fs.readFileSync(f, 'utf8')).paymentCode;
   return x;
@@ -107,7 +108,7 @@ function usage(code = 0) {
     // falsifiable. Across the internet you cannot, and the tool says so instead of assuming.
     let observer = null;
     const localPayee = path.join(DIR, `${positional[1]}.json`);
-    if (fs.existsSync(localPayee)) {
+    if (safeWalletName(positional[1]) && fs.existsSync(localPayee)) {
       observer = await QiAgent.load({ name: positional[1], dir: DIR, rpc: RPC });
       await observer.connect();
     }

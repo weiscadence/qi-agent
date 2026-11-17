@@ -11,7 +11,7 @@
  * every payment you ever receive is a public, aggregated, permanent record of your income.
  *
  * WHAT THIS LIBRARY ADDS OVER THE RAW SDK
- * Four undocumented traps, each of which cost us a debugging session and each of which fails
+ * Five undocumented traps, each of which cost us a debugging session and each of which fails
  * SILENTLY — that is, produces a plausible wrong answer rather than an error:
  *
  *   1. usePathing. `usePathing:true` makes quais APPEND the shard path to your RPC URL. If your
@@ -38,7 +38,10 @@
  *
  * So every read in here is CANARY-GATED: the SDK provider is proven against a raw JSON-RPC
  * block number before any number it reports is believed, and an untrusted read THROWS rather
- * than returning a comfortable zero. A zero from this library is a measured zero.
+ * than returning a comfortable zero. Scope of that guarantee: the canary compares the SDK
+ * against a raw call to the SAME RPC endpoint, within a 50-block tolerance. It catches a
+ * misconfigured or dead SDK provider; it cannot catch an endpoint that is itself wrong or
+ * lagging, and a zero with no channel open is still inconclusive (see zeroIsConclusive).
  *
  * TESTNET SAFETY: seeds are written to 0600 files. Treat any wallet file as a private key.
  *
@@ -72,14 +75,39 @@ class QiTrapError extends Error {
   constructor(msg, trap) { super(msg); this.name = 'QiTrapError'; this.code = 'TRAP'; this.trap = trap; }
 }
 
-/** Raw JSON-RPC, deliberately NOT through the SDK — this is the independent side of the canary. */
+/**
+ * Wallet names become file names. Refuse anything that could leave the wallet directory
+ * (`../x`, `a/b`) instead of reading or writing a seed file somewhere unexpected.
+ */
+function safeWalletName(name) {
+  return typeof name === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) && !name.includes('..');
+}
+function assertWalletName(name) {
+  if (!safeWalletName(name)) {
+    throw new QiTrapError(`wallet name ${JSON.stringify(name)} is not a plain file name — use letters, digits, ".", "_" or "-"`, 'wallet-name');
+  }
+}
+
+/** quais shard nicknames, as they appear as the last path segment of an RPC URL. */
+const SHARD_PATH_RE = /\/(prime|cyprus[1-3]?|paxos[1-3]?|hydra[1-3]?)\/?$/i;
+
+/**
+ * Raw JSON-RPC, deliberately NOT through the SDK — this is the SDK-independent side of the
+ * canary. It talks to the same endpoint, so it proves the SDK wiring, not the endpoint.
+ */
 async function rawBlockNumber(rpc) {
-  const r = await fetch(rpc, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'quai_blockNumber', params: [] }),
-  });
-  const j = await r.json();
+  let j;
+  try {
+    const r = await fetch(rpc, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'quai_blockNumber', params: [] }),
+    });
+    j = await r.json();
+  } catch (e) {
+    // An unreachable node must surface as UNTRUSTED, not as a bare TypeError("fetch failed").
+    throw new QiUntrustedError(`raw RPC unreachable at ${rpc}: ${e.cause?.code || e.message}`);
+  }
   if (!j || typeof j.result !== 'string') throw new QiUntrustedError(`raw RPC returned no block number from ${rpc}`);
   return parseInt(j.result, 16);
 }
@@ -104,6 +132,9 @@ class QiAgent {
     this.quaiAddress = record.quaiAddress || null;
     this.dir = opts.dir || DEFAULT_DIR;
     this.rpc = opts.rpc || DEFAULT_RPC;
+    // Trap 1. false: `rpc` already names the shard (…/cyprus1). true: `rpc` is a bare base URL
+    // and quais appends the shard path itself. Mixing the two is refused in connect().
+    this.usePathing = opts.usePathing === true;
     this.zone = opts.zone || quais.Zone.Cyprus1;
     this.shard = opts.shard || quais.Shard.Cyprus1;
     this.provider = null;
@@ -123,6 +154,7 @@ class QiAgent {
    */
   static async create({ name, dir = DEFAULT_DIR, save = true, ...opts } = {}) {
     if (!name) throw new Error('create({ name }) requires a name');
+    assertWalletName(name);
     const zone = opts.zone || quais.Zone.Cyprus1;
     const mnemonic = quais.Mnemonic.fromEntropy(quais.randomBytes(16));
     const qiWallet = quais.QiHDWallet.fromMnemonic(mnemonic);
@@ -150,6 +182,7 @@ class QiAgent {
 
   /** Restore from a saved wallet file. See _restoreWallet for why the shape matters. */
   static async load({ name, dir = DEFAULT_DIR, ...opts } = {}) {
+    assertWalletName(name);
     const file = path.join(dir, `${name}.json`);
     if (!fs.existsSync(file)) throw new Error(`no wallet at ${file} — run create({ name: '${name}' }) first`);
     return new QiAgent(JSON.parse(fs.readFileSync(file, 'utf8')), { dir, ...opts });
@@ -183,9 +216,16 @@ class QiAgent {
   async connect({ tolerance = 50 } = {}) {
     // usePathing MUST be false when the URL names the shard (…/cyprus1). If yours does not,
     // pass an unsuffixed base URL and set usePathing:true — those are the only two configs
-    // that work, and mixing them is the double-append timeout.
-    this.provider = new quais.JsonRpcProvider(this.rpc, undefined, { usePathing: false });
-    const raw = await rawBlockNumber(this.rpc);
+    // that work, and mixing them is the double-append timeout. Refuse the mix by name.
+    if (this.usePathing && SHARD_PATH_RE.test(this.rpc)) {
+      throw new QiTrapError(
+        `usePathing:true with an RPC URL that already names a shard (${this.rpc}) — quais would append the shard path a second time and every call would time out. Drop the suffix or pass usePathing:false.`,
+        'use-pathing');
+    }
+    this.provider = new quais.JsonRpcProvider(this.rpc, undefined, { usePathing: this.usePathing });
+    // The raw side has no SDK to append the path for it.
+    const rawUrl = this.usePathing ? `${this.rpc.replace(/\/+$/, '')}/cyprus1` : this.rpc;
+    const raw = await rawBlockNumber(rawUrl);
     let sdk = null;
     try { sdk = await this.provider.getBlockNumber(this.shard); } catch (e) { sdk = null; }
     this.blockNumber = raw;
@@ -531,7 +571,7 @@ class QiAgent {
 }
 
 module.exports = {
-  QiAgent, QiUntrustedError, QiTrapError,
+  QiAgent, QiUntrustedError, QiTrapError, safeWalletName,
   CONVERSION_LOCK_BLOCKS, CONVERSION_MIN_QUAI,
   DEFAULT_RPC, DEFAULT_DIR,
   quais,
