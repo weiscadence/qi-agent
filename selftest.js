@@ -11,7 +11,11 @@
  * the negative tests vacuously. Test 1 proves the real RPC connects and the canary passes, so
  * the failures below are discriminating rather than universal.
  *
- * Run: node selftest.js            (needs network for tests 1 and 6; the rest are offline)
+ * Run: node selftest.js            (needs the live Orchard RPC: test 1 is the positive control
+ *                                   and the suite exits 2 without it; 0a-0c are offline)
+ *
+ * NOT covered here: pay()/convert() with --send, waitForPayment() actually being paid, and the
+ * deep sweep recovering a non-zero amount — those need a funded wallet.
  * Exit: 0 all passed · 1 a guard did not fire · 2 the positive control failed (suite untrusted)
  */
 const fs = require('fs');
@@ -46,6 +50,18 @@ async function expectThrow(name, fn, Type, matcher) {
   if (haveWallets) subject = await QiAgent.load({ name: 'agent-alice', dir });
   else subject = await QiAgent.create({ name: 'selftest-agent', dir: tmp });
 
+  // ── 0. offline guards: no network needed ──────────────────────────────────
+  await expectThrow('0a wallet name cannot escape the wallet dir (load)', async () => {
+    await QiAgent.load({ name: '../selftest-agent', dir: path.join(tmp, 'sub') });
+  }, QiTrapError, /plain file name/);
+  await expectThrow('0b wallet name cannot escape the wallet dir (create)', async () => {
+    await QiAgent.create({ name: 'a/b', dir: tmp });
+  }, QiTrapError, /plain file name/);
+  await expectThrow('0c usePathing:true + shard-suffixed URL is refused by name (trap 1)', async () => {
+    const a = new QiAgent(subject.record, { dir: subject.dir, rpc: 'https://orchard.rpc.quai.network/cyprus1', usePathing: true });
+    await a.connect();
+  }, QiTrapError, /usePathing/);
+
   // ── 1. POSITIVE CONTROL ────────────────────────────────────────────────────
   // If this fails, every negative test below is meaningless and the suite is UNTRUSTED.
   let live = false;
@@ -65,7 +81,7 @@ async function expectThrow(name, fn, Type, matcher) {
     await a.connect();
     // If connect() ever stops throwing, this is the silent-failure shape we are guarding:
     return await a.balance();
-  }, undefined, /canary FAILED|fetch failed|ECONNREFUSED|UNTRUSTED/i);
+  }, QiUntrustedError, /unreachable|canary FAILED/);
 
   // ── 3. the block-height comparison is live, not a no-op ───────────────────
   // Test 2 proves the canary catches an unreachable node, but a comparison that never
@@ -124,15 +140,24 @@ async function expectThrow(name, fn, Type, matcher) {
   // ── 8. wallet-shape branch ─────────────────────────────────────────────────
   // A serialized-only wallet file has no mnemonic, so it cannot touch the QUAI ledger. The old
   // failure mode was an opaque "cannot read properties of undefined" from inside the SDK.
-  if (fs.existsSync(path.join(dir, 'agent-bob.json'))) {
-    const bob = await QiAgent.load({ name: 'agent-bob', dir });
+  // Uses agent-bob.json when present; otherwise builds a serialized-only fixture so this branch
+  // is always exercised instead of silently skipped.
+  {
+    let bobName = 'agent-bob', bobDir = dir;
+    if (!fs.existsSync(path.join(dir, 'agent-bob.json'))) {
+      const seed = await QiAgent.create({ name: 'selftest-serialized-src', dir: tmp });
+      const w = quais.QiHDWallet.fromMnemonic(quais.Mnemonic.fromPhrase(seed.record.mnemonic));
+      bobName = 'selftest-serialized'; bobDir = tmp;
+      fs.writeFileSync(path.join(tmp, `${bobName}.json`), JSON.stringify({
+        name: bobName, serialized: w.serialize(), paymentCode: seed.paymentCode, qiAddress: seed.qiAddress,
+      }), { mode: 0o600 });
+    }
+    const bob = await QiAgent.load({ name: bobName, dir: bobDir });
     await bob.connect(); // must succeed: a serialized Qi wallet restores fine
     ok('8a serialized-only wallet restores and connects', `code ${bob.paymentCode.slice(0, 14)}…`);
     await expectThrow('8b serialized-only wallet refuses to convert with a clear reason', async () => {
       return await bob.convert('10', { dryRun: true });
     }, QiTrapError, /serialized/);
-  } else {
-    console.log('  SKIP  8 wallet-shape branch (no agent-bob.json present)');
   }
 
   // ── 9. refusing to overwrite an existing wallet file ──────────────────────
